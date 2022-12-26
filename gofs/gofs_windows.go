@@ -940,9 +940,18 @@ func (fs *fileSystem) Rename(
 	// After exit, the remaining file will be reopened and
 	// seek to its orignal offset, so that we can continue
 	// our operations.
-	pos, err := handle.file.Seek(0, os.SEEK_CUR)
+	fileInfo, err := handle.file.Stat()
 	if err != nil {
 		return err
+	}
+	var pos *int64
+	if fileInfo.Mode().IsRegular() {
+		value, err := handle.file.Seek(0, os.SEEK_CUR)
+		if err != nil {
+			return err
+		}
+		pos = new(int64)
+		*pos = value
 	}
 	_ = handle.file.Close()
 	handle.file = nil
@@ -956,8 +965,10 @@ func (fs *fileSystem) Rename(
 				_ = f.Close()
 			}
 		}()
-		if _, err := f.Seek(pos, os.SEEK_SET); err != nil {
-			return
+		if pos != nil {
+			if _, err := f.Seek(*pos, os.SEEK_SET); err != nil {
+				return
+			}
 		}
 		handle.file, f = f, nil
 	}()
