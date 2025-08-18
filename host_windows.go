@@ -2,6 +2,7 @@ package winfsp
 
 import (
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -19,29 +21,33 @@ import (
 // with which the callers can operate and manipulate the
 // file system, except for destroying it.
 type FileSystemRef struct {
-	fileSystemOps     *FSP_FILE_SYSTEM_INTERFACE
-	fileSystem        *FSP_FILE_SYSTEM
-	base              BehaviourBase
-	getVolumeInfo     BehaviourGetVolumeInfo
-	setVolumeLabel    BehaviourSetVolumeLabel
-	getSecurityByName BehaviourGetSecurityByName
-	create            BehaviourCreate
-	overwrite         BehaviourOverwrite
-	cleanup           BehaviourCleanup
-	read              BehaviourRead
-	write             BehaviourWrite
-	flush             BehaviourFlush
-	getFileInfo       BehaviourGetFileInfo
-	setBasicInfo      BehaviourSetBasicInfo
-	setFileSize       BehaviourSetFileSize
-	canDelete         BehaviourCanDelete
-	rename            BehaviourRename
-	getSecurity       BehaviourGetSecurity
-	setSecurity       BehaviourSetSecurity
-	readDirRaw        BehaviourReadDirectoryRaw
-	getDirInfoByName  BehaviourGetDirInfoByName
-	deviceIoControl   BehaviourDeviceIoControl
-	createEx          BehaviourCreateEx
+	fileSystemOps         *FSP_FILE_SYSTEM_INTERFACE
+	fileSystem            *FSP_FILE_SYSTEM
+	base                  BehaviourBase
+	getVolumeInfo         BehaviourGetVolumeInfo
+	setVolumeLabel        BehaviourSetVolumeLabel
+	getSecurityByName     BehaviourGetSecurityByName
+	create                BehaviourCreate
+	overwrite             BehaviourOverwrite
+	cleanup               BehaviourCleanup
+	read                  BehaviourRead
+	write                 BehaviourWrite
+	flush                 BehaviourFlush
+	getFileInfo           BehaviourGetFileInfo
+	setBasicInfo          BehaviourSetBasicInfo
+	setFileSize           BehaviourSetFileSize
+	canDelete             BehaviourCanDelete
+	rename                BehaviourRename
+	getSecurity           BehaviourGetSecurity
+	setSecurity           BehaviourSetSecurity
+	readDirRaw            BehaviourReadDirectoryRaw
+	getDirInfoByName      BehaviourGetDirInfoByName
+	deviceIoControl       BehaviourDeviceIoControl
+	createEx              BehaviourCreateEx
+	deleteReparsePoint    BehaviourDeleteReparsePoint
+	getReparsePoint       BehaviourGetReparsePoint
+	getReparsePointByName BehaviourGetReparsePointByName
+	setReparsePoint       BehaviourSetReparsePoint
 }
 
 // ntStatusNoRef is returned when user context to inner
@@ -116,12 +122,7 @@ func utf16PtrToString(ptr uintptr) string {
 }
 
 func enforceBytePtr(ptr uintptr, size int) []byte {
-	slice := &reflect.SliceHeader{
-		Data: ptr,
-		Len:  size,
-		Cap:  size,
-	}
-	return *(*[]byte)(unsafe.Pointer(slice))
+	return unsafe.Slice((*byte)(unsafe.Pointer(ptr)), size)
 }
 
 // FileSystem is the created object of WinFSP's filesystem.
@@ -639,7 +640,7 @@ func delegateSetBasicInfo(
 		flags |= SetBasicInfoLastAccessTime
 	}
 	if lastWriteTime != 0 {
-		flags |= SetBasicInfoLastAccessTime
+		flags |= SetBasicInfoLastWriteTime
 	}
 	if changeTime != 0 {
 		flags |= SetBasicInfoChangeTime
@@ -1010,6 +1011,32 @@ var go_delegateReadDirectory = syscall.NewCallbackCDecl(func(
 	))
 })
 
+// BehaviourReadDirectoryOffset is a low-level interface
+// for implementing reading of directories that is suitable
+// for filesystems that can read directories with pagination
+// implemented by an integer offset.
+type BehaviourReadDirectoryOffset interface {
+	ReadDirectoryOffset(
+		fs *FileSystemRef, file uintptr,
+		pattern *uint16, marker uint64, buf []byte,
+	) (int, error)
+}
+
+type behaviourReadDirectoryOffset struct {
+	readDirOffset BehaviourReadDirectoryOffset
+}
+
+func (d *behaviourReadDirectoryOffset) ReadDirectoryRaw(
+	fs *FileSystemRef, file uintptr,
+	pattern, marker *uint16, buf []byte,
+) (int, error) {
+	var offset uint64
+	if marker != nil {
+		offset = *(*uint64)(unsafe.Pointer(marker))
+	}
+	return d.readDirOffset.ReadDirectoryOffset(fs, file, pattern, offset, buf)
+}
+
 // BehaviourReadDirectory is the delegated interface which
 // requires a translation from file descriptor and its
 // dedicated directory buffer, alongside with occasionally
@@ -1226,25 +1253,472 @@ var go_delegateCreateEx = syscall.NewCallbackCDecl(func(
 	))
 })
 
+var (
+	posixMapSecurityDescriptorToPermissions *syscall.Proc
+	posixMapSidToUid                        *syscall.Proc
+	posixMapUidToSid                        *syscall.Proc
+	setSecurityDescriptor                   *syscall.Proc
+	deleteSecurityDescriptor                *syscall.Proc
+	fileSystemOperationProcessId            *syscall.Proc
+	fileSystemResolveReparsePoints          *syscall.Proc
+	fileSystemFindReparsePoint              *syscall.Proc
+	debugLogSetHandle                       *syscall.Proc
+	fileSystemSetDebugLogF                  *syscall.Proc
+)
+
+// BehaviourDeleteReparsePoint deletes a reparse point.
+type BehaviourDeleteReparsePoint interface {
+	DeleteReparsePoint(
+		fs *FileSystemRef, file uintptr, name string,
+		buffer []byte,
+	) error
+}
+
+func delegateDeleteReparsePoint(
+	fileSystem, fileContext, fileName uintptr,
+	buffer, size uintptr,
+) windows.NTStatus {
+	ref := loadFileSystemRef(fileSystem)
+	if ref == nil {
+		return ntStatusNoRef
+	}
+	return convertNTStatus(ref.deleteReparsePoint.DeleteReparsePoint(
+		ref, fileContext, utf16PtrToString(fileName),
+		enforceBytePtr(buffer, int(size)),
+	))
+}
+
+var go_delegateDeleteReparsePoint = syscall.NewCallbackCDecl(func(
+	fileSystem, fileContext, fileName uintptr,
+	buffer, size uintptr,
+) uintptr {
+	return uintptr(delegateDeleteReparsePoint(
+		fileSystem, fileContext, fileName,
+		buffer, size,
+	))
+})
+
+// BehaviourGetReparsePoint gets a reparse point.
+type BehaviourGetReparsePoint interface {
+	GetReparsePoint(
+		fs *FileSystemRef, file uintptr, name string,
+		buffer []byte,
+	) (int, error)
+}
+
+func delegateGetReparsePoint(
+	fileSystem, fileContext, fileName uintptr,
+	buffer uintptr, size *uintptr,
+) windows.NTStatus {
+	ref := loadFileSystemRef(fileSystem)
+	if ref == nil {
+		return ntStatusNoRef
+	}
+	bufferSize := int(*size)
+	usedBytes, err := ref.getReparsePoint.GetReparsePoint(
+		ref, fileContext, utf16PtrToString(fileName),
+		enforceBytePtr(buffer, bufferSize),
+	)
+	if err != nil {
+		return convertNTStatus(err)
+	}
+	*size = uintptr(usedBytes)
+	return windows.STATUS_SUCCESS
+}
+
+var go_delegateGetReparsePoint = syscall.NewCallbackCDecl(func(
+	fileSystem, fileContext, fileName uintptr,
+	buffer uintptr, size *uintptr,
+) uintptr {
+	return uintptr(delegateGetReparsePoint(
+		fileSystem, fileContext, fileName,
+		buffer, size,
+	))
+})
+
+// BehaviourGetReparsePoint gets a reparse point.
+type BehaviourGetReparsePointByName interface {
+	GetReparsePointByName(
+		fs *FileSystemRef, name string, isDirectory bool,
+		buffer []byte,
+	) (int, error)
+}
+
+func delegateGetReparsePointByName(
+	fileSystem, context, fileName uintptr,
+	isDirectory uint8, buffer uintptr, size *uintptr,
+) windows.NTStatus {
+	ref := loadFileSystemRef(fileSystem)
+	if ref == nil {
+		return ntStatusNoRef
+	}
+	var bufferSize int
+	if size != nil {
+		bufferSize = int(*size)
+	} else {
+		bufferSize = 0
+	}
+	usedBytes, err := ref.getReparsePointByName.GetReparsePointByName(
+		ref, utf16PtrToString(fileName), isDirectory != 0,
+		enforceBytePtr(buffer, bufferSize),
+	)
+	if err != nil {
+		return convertNTStatus(err)
+	}
+	if size != nil {
+		*size = uintptr(usedBytes)
+	}
+	return windows.STATUS_SUCCESS
+}
+
+var go_delegateGetReparsePointByName = syscall.NewCallbackCDecl(func(
+	fileSystem, context, fileName uintptr,
+	isDirectory uint8, buffer uintptr, size *uintptr,
+) uintptr {
+	return uintptr(delegateGetReparsePointByName(
+		fileSystem, context, fileName,
+		isDirectory, buffer, size,
+	))
+})
+
+func delegateResolveReparsePoints(
+	fileSystem, fileName uintptr,
+	reparsePointIndex uint32, resolveLastPathComponent uint8,
+	ioStatus, buffer uintptr, size *uintptr,
+) windows.NTStatus {
+	// Call the WinFSP API
+	result, _, err := fileSystemResolveReparsePoints.Call(
+		fileSystem,
+		go_delegateGetReparsePointByName,
+		uintptr(0),
+		fileName,
+		uintptr(reparsePointIndex),
+		uintptr(resolveLastPathComponent),
+		ioStatus,
+		buffer,
+		uintptr(unsafe.Pointer(size)),
+	)
+	status := windows.NTStatus(result)
+	if err != nil {
+		return convertNTStatus(err)
+	}
+	return status
+}
+
+var go_delegateResolveReparsePoints = syscall.NewCallbackCDecl(func(
+	fileSystem, fileName uintptr,
+	reparsePointIndex uint32, resolveLastPathComponent uint8,
+	ioStatus, buffer uintptr, size *uintptr,
+) uintptr {
+	return uintptr(delegateResolveReparsePoints(
+		fileSystem, fileName,
+		reparsePointIndex, resolveLastPathComponent,
+		ioStatus, buffer, size,
+	))
+})
+
+// BehaviourSetReparsePoint sets a reparse point.
+type BehaviourSetReparsePoint interface {
+	SetReparsePoint(
+		fs *FileSystemRef, file uintptr, name string,
+		buffer []byte,
+	) error
+}
+
+func delegateSetReparsePoint(
+	fileSystem, fileContext, fileName uintptr,
+	buffer, size uintptr,
+) windows.NTStatus {
+	ref := loadFileSystemRef(fileSystem)
+	if ref == nil {
+		return ntStatusNoRef
+	}
+	return convertNTStatus(ref.setReparsePoint.SetReparsePoint(
+		ref, fileContext, utf16PtrToString(fileName),
+		enforceBytePtr(buffer, int(size)),
+	))
+}
+
+var go_delegateSetReparsePoint = syscall.NewCallbackCDecl(func(
+	fileSystem, fileContext, fileName uintptr,
+	buffer, size uintptr,
+) uintptr {
+	return uintptr(delegateSetReparsePoint(
+		fileSystem, fileContext, fileName,
+		buffer, size,
+	))
+})
+
+// PosixMapSecurityDescriptorToPermissions maps a Windows security descriptor to POSIX permissions.
+func PosixMapSecurityDescriptorToPermissions(securityDescriptor *windows.SECURITY_DESCRIPTOR) (uid, gid, mode uint32, err error) {
+	result, _, callErr := posixMapSecurityDescriptorToPermissions.Call(
+		uintptr(unsafe.Pointer(securityDescriptor)),
+		uintptr(unsafe.Pointer(&uid)),
+		uintptr(unsafe.Pointer(&gid)),
+		uintptr(unsafe.Pointer(&mode)),
+	)
+
+	status := windows.NTStatus(result)
+	if status != windows.STATUS_SUCCESS {
+		callErr = status
+	} else if callErr == syscall.Errno(0) {
+		callErr = nil
+	}
+	if callErr != nil {
+		return 0, 0, 0, errors.Wrap(callErr, "FspPosixMapSecurityDescriptorToPermissions")
+	}
+
+	return uid, gid, mode, nil
+}
+
+// PosixMapSidToUid maps a Windows SID to a POSIX UID.
+func PosixMapSidToUid(sid *windows.SID) (uint32, error) {
+	var uid uint32
+	result, _, err := posixMapSidToUid.Call(
+		uintptr(unsafe.Pointer(sid)),
+		uintptr(unsafe.Pointer(&uid)),
+	)
+
+	status := windows.NTStatus(result)
+	if status != windows.STATUS_SUCCESS {
+		err = status
+	} else if err == syscall.Errno(0) {
+		err = nil
+	}
+	if err != nil {
+		return 0, errors.Wrap(err, "FspPosixMapSidToUid")
+	}
+
+	return uid, nil
+}
+
+// PosixMapUidToSid maps a POSIX UID to a Windows SID.
+func PosixMapUidToSid(uid uint32) (*windows.SID, error) {
+	var sid *windows.SID
+	result, _, err := posixMapUidToSid.Call(
+		uintptr(uid),
+		uintptr(unsafe.Pointer(&sid)),
+	)
+
+	status := windows.NTStatus(result)
+	if status != windows.STATUS_SUCCESS {
+		err = status
+	} else if err == syscall.Errno(0) {
+		err = nil
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "FspPosixMapUidToSid")
+	}
+
+	return sid, nil
+}
+
+// SetSecurityDescriptor modifies a security descriptor.
+//
+// This is a helper for implementing the SetSecurity operation.
+// It modifies an input security descriptor based on the provided
+// security information and modification descriptor.
+//
+// The windows.SECURITY_DESCRIPTOR returned by this function must be
+// manually freed by invoking DeleteSecurityDescriptor.
+func SetSecurityDescriptor(
+	inputDescriptor *windows.SECURITY_DESCRIPTOR,
+	securityInformation windows.SECURITY_INFORMATION,
+	modificationDescriptor *windows.SECURITY_DESCRIPTOR,
+) (*windows.SECURITY_DESCRIPTOR, error) {
+	var outputDescriptor *windows.SECURITY_DESCRIPTOR
+	result, _, err := setSecurityDescriptor.Call(
+		uintptr(unsafe.Pointer(inputDescriptor)),
+		uintptr(securityInformation),
+		uintptr(unsafe.Pointer(modificationDescriptor)),
+		uintptr(unsafe.Pointer(&outputDescriptor)),
+	)
+
+	status := windows.NTStatus(result)
+	if status != windows.STATUS_SUCCESS {
+		err = status
+	} else if err == syscall.Errno(0) {
+		err = nil
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "FspSetSecurityDescriptor")
+	}
+	return outputDescriptor, nil
+}
+
+// DeleteSecurityDescriptor deletes a security descriptor.
+//
+// This is a helper for cleaning up security descriptors created
+// by SetSecurityDescriptor.
+func DeleteSecurityDescriptor(securityDescriptor *windows.SECURITY_DESCRIPTOR) error {
+	// Pass a function pointer to indicate this was created by FspSetSecurityDescriptor
+	// The C API expects this to match the function that created the descriptor
+	_, _, _ = deleteSecurityDescriptor.Call(
+		uintptr(unsafe.Pointer(securityDescriptor)),
+		uintptr(unsafe.Pointer(setSecurityDescriptor)),
+	)
+
+	return nil
+}
+
+// DebugLogSetHandle sets the debug log handle for WinFSP debugging output.
+//
+// This function sets the handle where debug messages will be written when debug
+// logging is enabled. The handle should be a valid Windows file handle.
+func DebugLogSetHandle(handle syscall.Handle) error {
+	if err := tryLoadWinFSP(); err != nil {
+		return err
+	}
+
+	_, _, err := debugLogSetHandle.Call(uintptr(handle))
+	if err == syscall.Errno(0) {
+		err = nil
+	}
+	return err
+}
+
+// FileSystemOperationProcessId gets the originating process ID.
+//
+// Valid only during Create, Open and Rename requests when the target exists.
+// This function can only be called from within a file system operation handler.
+func FileSystemOperationProcessId() uint32 {
+	result, _, _ := fileSystemOperationProcessId.Call()
+	return uint32(result)
+}
+
+func FileSystemFindReparsePoint(
+	fileSystem *FileSystemRef, fileName string,
+) (bool, uint32, error) {
+	utf16FileName, err := windows.UTF16PtrFromString(fileName)
+	if err != nil {
+		return false, 0, errors.Wrap(err, "convert filename to UTF16")
+	}
+
+	var reparsePointIndex uint32
+
+	result, _, callErr := fileSystemFindReparsePoint.Call(
+		uintptr(unsafe.Pointer(fileSystem.fileSystem)), // FileSystem
+		go_delegateGetReparsePointByName,               // GetReparsePointByName callback
+		uintptr(0),                                     // Context (unused)
+		uintptr(unsafe.Pointer(utf16FileName)),         // FileName
+		uintptr(unsafe.Pointer(&reparsePointIndex)),    // PReparsePointIndex
+	)
+
+	if callErr == syscall.Errno(0) {
+		callErr = nil
+	}
+	if callErr != nil {
+		return false, 0, errors.Wrap(callErr, "FspFileSystemFindReparsePoint")
+	}
+	return byte(result) != 0, reparsePointIndex, nil
+}
+
+const (
+	dirInfoAlignment uint16 = uint16(unsafe.Alignof(FSP_FSCTL_DIR_INFO{}))
+	replacementChar         = '\uFFFD' // Unicode replacement character
+)
+
+// FileSystemAddDirInfo adds directory information to a buffer like
+// FspFileSystemAddDirInfo.
+func FileSystemAddDirInfo(
+	name string,
+	nextOffset uint64,
+	fileInfo *FSP_FSCTL_FILE_INFO,
+	buffer []byte,
+) int {
+	if fileInfo == nil {
+		// Then we just need to write two null bytes.
+		if len(buffer) < 2 {
+			return 0
+		}
+		buffer[0] = 0
+		buffer[1] = 0
+		return 2
+	}
+
+	var utf16Len uint16
+	for _, r := range name {
+		switch utf16.RuneLen(r) {
+		case 1:
+			utf16Len++
+		case 2:
+			utf16Len += 2
+		default:
+			utf16Len++
+		}
+	}
+
+	dirInfoSize := uint16(unsafe.Sizeof(FSP_FSCTL_DIR_INFO{}))
+	requiredSize := dirInfoSize + utf16Len*SIZEOF_WCHAR
+	alignedSize := (requiredSize + dirInfoAlignment - 1) & ^(dirInfoAlignment - 1)
+	if uint16(len(buffer)) < alignedSize {
+		return 0
+	}
+
+	di := (*FSP_FSCTL_DIR_INFO)(unsafe.Pointer(&buffer[0]))
+	if fileInfo != nil {
+		di.FileInfo = *fileInfo
+	}
+	di.NextOffset = nextOffset
+	di.Padding0 = 0
+	di.Padding1 = 0
+	di.Size = requiredSize
+
+	// Encode the string directly into the buffer as UTF-16
+	var utf16Buffer []uint16 = unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[dirInfoSize])), utf16Len)
+	utf16Index := 0
+	for _, r := range name {
+		switch utf16.RuneLen(r) {
+		case 1:
+			utf16Buffer[utf16Index] = uint16(r)
+			utf16Index++
+		case 2:
+			r1, r2 := utf16.EncodeRune(r)
+			utf16Buffer[utf16Index] = uint16(r1)
+			utf16Buffer[utf16Index+1] = uint16(r2)
+			utf16Index += 2
+		default:
+			utf16Buffer[utf16Index] = uint16(replacementChar)
+			utf16Index++
+		}
+	}
+
+	return int(alignedSize)
+}
+
 type option struct {
-	caseSensitive  bool
-	volumePrefix   string
-	fileSystemName string
-	passPattern    bool
-	creationTime   time.Time
+	caseSensitive            bool
+	volumePrefix             string
+	fileSystemName           string
+	passPattern              bool
+	attributes               uint32
+	creationTime             time.Time
+	debug                    bool
+	sectorSize               uint16
+	sectorsPerAllocationUnit uint16
 }
 
 func newOption() *option {
 	return &option{
-		caseSensitive:  false,
-		volumePrefix:   "",
-		fileSystemName: "WinFSP",
-		creationTime:   time.Now(),
+		caseSensitive:            false,
+		volumePrefix:             "",
+		fileSystemName:           "WinFSP",
+		creationTime:             time.Now(),
+		sectorSize:               512,
+		sectorsPerAllocationUnit: 1,
 	}
 }
 
 // Option is the options that could be passed to mount.
 type Option func(*option)
+
+// Attributes can be used to apply additional FspFSAttribute
+// attributes to the filesystem.
+func Attributes(value uint32) Option {
+	return func(o *option) {
+		o.attributes |= value
+	}
+}
 
 // CaseSensitive is used to indicate whether the underlying
 // file system can be distinguied case sensitively.
@@ -1256,6 +1730,15 @@ type Option func(*option)
 func CaseSensitive(value bool) Option {
 	return func(o *option) {
 		o.caseSensitive = value
+	}
+}
+
+// Debug controls whether WinFSP's debug logging will be
+// emitted for this file system. The destination for the debug
+// logging can be set using the DebugLogSetHandle function.
+func Debug(value bool) Option {
+	return func(o *option) {
+		o.debug = value
 	}
 }
 
@@ -1289,6 +1772,15 @@ func CreationTime(value time.Time) Option {
 func PassPattern(value bool) Option {
 	return func(o *option) {
 		o.passPattern = value
+	}
+}
+
+// SectorSize sets the sector size and sectors per allocation unit
+// for the volume.
+func SectorSize(sectorSize, sectorsPerAllocationUnit uint16) Option {
+	return func(o *option) {
+		o.sectorSize = sectorSize
+		o.sectorsPerAllocationUnit = sectorsPerAllocationUnit
 	}
 }
 
@@ -1342,11 +1834,10 @@ func Mount(
 			refMap.Delete(fileSystemAddr)
 		}
 	}()
-	attributes := uint32(0)
+	attributes := option.attributes
 	if option.caseSensitive {
 		attributes |= FspFSAttributeCaseSensitive
 	}
-	attributes |= FspFSAttributeCasePreservedNames
 	attributes |= FspFSAttributeUnicodeOnDisk
 	attributes |= FspFSAttributePersistentAcls
 	attributes |= FspFSAttributeFlushAndPurgeOnCleanup
@@ -1409,6 +1900,31 @@ func Mount(
 		fileSystemRef.getFileInfo = inner
 		fileSystemOps.GetFileInfo = go_delegateGetFileInfo
 	}
+	if inner, ok := fs.(BehaviourDeviceIoControl); ok {
+		fileSystemRef.deviceIoControl = inner
+		fileSystemOps.Control = go_delegateDeviceIoControl
+	}
+	if inner, ok := fs.(BehaviourDeleteReparsePoint); ok {
+		fileSystemRef.deleteReparsePoint = inner
+		fileSystemOps.DeleteReparsePoint = go_delegateDeleteReparsePoint
+	}
+	if inner, ok := fs.(BehaviourGetReparsePoint); ok {
+		fileSystemRef.getReparsePoint = inner
+		fileSystemOps.GetReparsePoint = go_delegateGetReparsePoint
+	}
+	if inner, ok := fs.(BehaviourGetReparsePointByName); ok {
+		attributes |= FspFSAttributeReparsePoints
+		fileSystemRef.getReparsePointByName = inner
+		fileSystemOps.ResolveReparsePoints = go_delegateResolveReparsePoints
+	}
+	if inner, ok := fs.(BehaviourSetReparsePoint); ok {
+		fileSystemRef.setReparsePoint = inner
+		fileSystemOps.SetReparsePoint = go_delegateSetReparsePoint
+	}
+	if inner, ok := fs.(BehaviourSetBasicInfo); ok {
+		fileSystemRef.setBasicInfo = inner
+		fileSystemOps.SetBasicInfo = go_delegateSetBasicInfo
+	}
 	if inner, ok := fs.(BehaviourSetFileSize); ok {
 		fileSystemRef.setFileSize = inner
 		fileSystemOps.SetFileSize = go_delegateSetFileSize
@@ -1429,7 +1945,13 @@ func Mount(
 		fileSystemRef.setSecurity = inner
 		fileSystemOps.SetSecurity = go_delegateSetSecurity
 	}
-	if inner, ok := fs.(BehaviourReadDirectoryRaw); ok {
+	if inner, ok := fs.(BehaviourReadDirectoryOffset); ok {
+		attributes |= FspFSAttributeDirectoryMarkerAsNextOffset
+		fileSystemRef.readDirRaw = &behaviourReadDirectoryOffset{
+			readDirOffset: inner,
+		}
+		fileSystemOps.ReadDirectory = go_delegateReadDirectory
+	} else if inner, ok := fs.(BehaviourReadDirectoryRaw); ok {
 		fileSystemRef.readDirRaw = inner
 		fileSystemOps.ReadDirectory = go_delegateReadDirectory
 	} else if inner, ok := fs.(BehaviourReadDirectory); ok {
@@ -1477,8 +1999,8 @@ func Mount(
 	sizeOfVolumeParamsV1 := uint16(unsafe.Sizeof(
 		FSP_FSCTL_VOLUME_PARAMS_V1{}))
 	volumeParams.SizeOfVolumeParamsV1 = sizeOfVolumeParamsV1
-	volumeParams.SectorSize = 1
-	volumeParams.SectorsPerAllocationUnit = 4096
+	volumeParams.SectorSize = option.sectorSize
+	volumeParams.SectorsPerAllocationUnit = option.sectorsPerAllocationUnit
 	nowFiletime := syscall.NsecToFiletime(
 		option.creationTime.UnixNano())
 	volumeParams.VolumeCreationTime =
@@ -1512,6 +2034,17 @@ func Mount(
 		}
 	}()
 	result.fileSystem.UserContext = fileSystemAddr
+
+	if option.debug {
+		// Set debug log level to maximum for debug output
+		_, _, err = fileSystemSetDebugLogF.Call(
+			uintptr(unsafe.Pointer(result.fileSystem)),
+			uintptr(math.MaxUint32),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "FspFileSystemSetDebugLogF")
+		}
+	}
 
 	// Attempt to mount the file system at mount point.
 	mountResult, _, err := setMountPoint.Call(
@@ -1561,6 +2094,49 @@ func (f *FileSystem) Unmount() {
 	_, _, _ = fileSystemDelete.Call(fileSystem)
 }
 
+// BinPath returns the path to the bin folder where WinFSP is
+// installed.
+func BinPath() (string, error) {
+	// Well, we must lookup the registry to find our
+	// winFSP installation now.
+	findInstallError := func(err error) error {
+		return errors.Wrapf(err, "winfsp find installation")
+	}
+	var keyReg syscall.Handle // HKLM\\Software\\WinFSP
+	keyName, err := syscall.UTF16PtrFromString("Software\\WinFsp")
+	if err != nil {
+		return "", findInstallError(err)
+	}
+	if err := syscall.RegOpenKeyEx(
+		syscall.HKEY_LOCAL_MACHINE, keyName, 0,
+		syscall.KEY_READ|syscall.KEY_WOW64_32KEY, &keyReg,
+	); err != nil {
+		return "", findInstallError(err)
+	}
+	defer syscall.RegCloseKey(keyReg)
+	valueName, err := syscall.UTF16PtrFromString("InstallDir")
+	if err != nil {
+		return "", findInstallError(err)
+	}
+	var pathBuf [syscall.MAX_PATH]uint16
+	var valueType, valueSize uint32
+	valueSize = uint32(len(pathBuf)) * SIZEOF_WCHAR
+	if err := syscall.RegQueryValueEx(
+		keyReg, valueName, nil, &valueType,
+		(*byte)(unsafe.Pointer(&pathBuf)), &valueSize,
+	); err != nil {
+		return "", findInstallError(err)
+	}
+	if valueType != syscall.REG_SZ {
+		return "", findInstallError(syscall.ERROR_MOD_NOT_FOUND)
+	}
+	path := pathBuf[:int(valueSize/SIZEOF_WCHAR)]
+	if len(path) > 0 && path[len(path)-1] == 0 {
+		path = path[:len(path)-1]
+	}
+	return filepath.Join(syscall.UTF16ToString(path), "bin"), nil
+}
+
 // loadWinFSPDLL attempts to locate and load the DLL, the
 // library handle will be available from now on.
 func loadWinFSPDLL() (*syscall.DLL, error) {
@@ -1583,54 +2159,15 @@ func loadWinFSPDLL() (*syscall.DLL, error) {
 	if dll != nil {
 		return dll, nil
 	}
-
-	// Well, we must lookup the registry to find our
-	// winFSP installation now.
-	findInstallError := func(err error) error {
-		return errors.Wrapf(err, "winfsp find installation")
-	}
-	var keyReg syscall.Handle // HKLM\\Software\\WinFSP
-	keyName, err := syscall.UTF16PtrFromString("Software\\WinFsp")
+	installPath, err := BinPath()
 	if err != nil {
-		return nil, findInstallError(err)
+		return nil, err
 	}
-	if err := syscall.RegOpenKeyEx(
-		syscall.HKEY_LOCAL_MACHINE, keyName, 0,
-		syscall.KEY_READ|syscall.KEY_WOW64_32KEY, &keyReg,
-	); err != nil {
-		return nil, findInstallError(err)
-	}
-	defer syscall.RegCloseKey(keyReg)
-	valueName, err := syscall.UTF16PtrFromString("InstallDir")
-	if err != nil {
-		return nil, findInstallError(err)
-	}
-	var pathBuf [syscall.MAX_PATH]uint16
-	var valueType, valueSize uint32
-	valueSize = uint32(len(pathBuf)) * SIZEOF_WCHAR
-	if err := syscall.RegQueryValueEx(
-		keyReg, valueName, nil, &valueType,
-		(*byte)(unsafe.Pointer(&pathBuf)), &valueSize,
-	); err != nil {
-		return nil, findInstallError(err)
-	}
-	if valueType != syscall.REG_SZ {
-		return nil, findInstallError(syscall.ERROR_MOD_NOT_FOUND)
-	}
-	path := pathBuf[:int(valueSize/SIZEOF_WCHAR)]
-	if len(path) > 0 && path[len(path)-1] == 0 {
-		path = path[:len(path)-1]
-	}
-	installPath := syscall.UTF16ToString(path)
-
 	// Attempt to load the DLL that we have found.
-	return syscall.LoadDLL(filepath.Join(
-		installPath, "bin", dllName))
+	return syscall.LoadDLL(filepath.Join(installPath, dllName))
 }
 
-var (
-	winFSPDLL *syscall.DLL
-)
+var winFSPDLL *syscall.DLL
 
 func findProc(name string, target **syscall.Proc) error {
 	proc, err := winFSPDLL.FindProc(name)
@@ -1658,16 +2195,26 @@ func initWinFSP() error {
 	}
 	winFSPDLL = dll
 	return loadProcs(map[string]**syscall.Proc{
-		"FspFileSystemDeleteDirectoryBuffer":  &deleteDirectoryBuffer,
-		"FspFileSystemAcquireDirectoryBuffer": &acquireDirectoryBuffer,
-		"FspFileSystemReleaseDirectoryBuffer": &releaseDirectoryBuffer,
-		"FspFileSystemReadDirectoryBuffer":    &readDirectoryBuffer,
-		"FspFileSystemFillDirectoryBuffer":    &fillDirectoryBuffer,
-		"FspFileSystemCreate":                 &fileSystemCreate,
-		"FspFileSystemDelete":                 &fileSystemDelete,
-		"FspFileSystemSetMountPoint":          &setMountPoint,
-		"FspFileSystemStartDispatcher":        &startDispatcher,
-		"FspFileSystemStopDispatcher":         &stopDispatcher,
+		"FspFileSystemDeleteDirectoryBuffer":         &deleteDirectoryBuffer,
+		"FspFileSystemAcquireDirectoryBuffer":        &acquireDirectoryBuffer,
+		"FspFileSystemReleaseDirectoryBuffer":        &releaseDirectoryBuffer,
+		"FspFileSystemReadDirectoryBuffer":           &readDirectoryBuffer,
+		"FspFileSystemFillDirectoryBuffer":           &fillDirectoryBuffer,
+		"FspDebugLogSetHandle":                       &debugLogSetHandle,
+		"FspDeleteSecurityDescriptor":                &deleteSecurityDescriptor,
+		"FspFileSystemCreate":                        &fileSystemCreate,
+		"FspFileSystemDelete":                        &fileSystemDelete,
+		"FspFileSystemFindReparsePoint":              &fileSystemFindReparsePoint,
+		"FspFileSystemOperationProcessIdF":           &fileSystemOperationProcessId,
+		"FspFileSystemResolveReparsePoints":          &fileSystemResolveReparsePoints,
+		"FspFileSystemSetDebugLogF":                  &fileSystemSetDebugLogF,
+		"FspFileSystemSetMountPoint":                 &setMountPoint,
+		"FspFileSystemStartDispatcher":               &startDispatcher,
+		"FspFileSystemStopDispatcher":                &stopDispatcher,
+		"FspPosixMapSecurityDescriptorToPermissions": &posixMapSecurityDescriptorToPermissions,
+		"FspPosixMapSidToUid":                        &posixMapSidToUid,
+		"FspPosixMapUidToSid":                        &posixMapUidToSid,
+		"FspSetSecurityDescriptor":                   &setSecurityDescriptor,
 	})
 }
 
