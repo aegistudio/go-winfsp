@@ -2041,6 +2041,9 @@ func Mount(
 			uintptr(unsafe.Pointer(result.fileSystem)),
 			uintptr(math.MaxUint32),
 		)
+		if err == syscall.Errno(0) {
+			err = nil
+		}
 		if err != nil {
 			return nil, errors.Wrap(err, "FspFileSystemSetDebugLogF")
 		}
