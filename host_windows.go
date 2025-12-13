@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -845,11 +846,11 @@ var go_delegateSetSecurity = syscall.NewCallbackCDecl(func(
 })
 
 var (
-	deleteDirectoryBuffer  *syscall.Proc
-	acquireDirectoryBuffer *syscall.Proc
-	releaseDirectoryBuffer *syscall.Proc
-	readDirectoryBuffer    *syscall.Proc
-	fillDirectoryBuffer    *syscall.Proc
+	deleteDirectoryBuffer  dllProc
+	acquireDirectoryBuffer dllProc
+	releaseDirectoryBuffer dllProc
+	readDirectoryBuffer    dllProc
+	fillDirectoryBuffer    dllProc
 )
 
 // DirBuffer is the directory buffer block which can be
@@ -864,7 +865,7 @@ type DirBuffer struct {
 
 // Delete the directory buffer.
 func (buf *DirBuffer) Delete() {
-	_, _, _ = deleteDirectoryBuffer.Call(
+	_, _ = deleteDirectoryBuffer.Call(
 		uintptr(unsafe.Pointer(&buf.ptr)))
 }
 
@@ -875,7 +876,7 @@ func (buf *DirBuffer) ReadDirectory(
 ) int {
 	var bytesTransferred uint32
 	slice := (*reflect.SliceHeader)(unsafe.Pointer(&buffer))
-	_, _, _ = readDirectoryBuffer.Call(
+	_, _ = readDirectoryBuffer.Call(
 		uintptr(unsafe.Pointer(&buf.ptr)),
 		uintptr(unsafe.Pointer(marker)),
 		slice.Data, uintptr(slice.Len),
@@ -901,15 +902,10 @@ func (buf *DirBuffer) Acquire(reset bool) (*DirBufferFiller, error) {
 	if reset {
 		resetVal = uintptr(1)
 	}
-	var status windows.NTStatus
-	acquireOk, _, _ := acquireDirectoryBuffer.Call(
+	acquireOk, err := acquireDirectoryBuffer.Call(
 		uintptr(unsafe.Pointer(&buf.ptr)), resetVal,
-		uintptr(unsafe.Pointer(&status)),
+		ntStatusPtr,
 	)
-	var err error
-	if status != windows.STATUS_SUCCESS {
-		err = status
-	}
 	// BUG: microsoft's calling convention sets AL to 1
 	// when the result is BOOLEAN, so we must only look
 	// at the lowest bit of the digits then.
@@ -951,14 +947,10 @@ func (b *DirBufferFiller) Fill(
 		Cap:  len(utf16),
 	})))
 	copy(target, utf16)
-	var status windows.NTStatus
-	copyOk, _, _ := fillDirectoryBuffer.Call(
+	copyOk, err := fillDirectoryBuffer.Call(
 		uintptr(unsafe.Pointer(&b.buf.ptr)), alignedAddr,
-		uintptr(unsafe.Pointer(&status)),
+		ntStatusPtr,
 	)
-	if status != windows.STATUS_SUCCESS {
-		err = status
-	}
 	runtime.KeepAlive(alignedBuffer)
 	// BUG: same bug as the acquire counterpart here.
 	return uint8(copyOk) != 0, err
@@ -966,7 +958,7 @@ func (b *DirBufferFiller) Fill(
 
 // Release the directory buffer filler.
 func (b *DirBufferFiller) Release() {
-	_, _, _ = releaseDirectoryBuffer.Call(
+	_, _ = releaseDirectoryBuffer.Call(
 		uintptr(unsafe.Pointer(&b.buf.ptr)))
 }
 
@@ -1254,16 +1246,16 @@ var go_delegateCreateEx = syscall.NewCallbackCDecl(func(
 })
 
 var (
-	posixMapSecurityDescriptorToPermissions *syscall.Proc
-	posixMapSidToUid                        *syscall.Proc
-	posixMapUidToSid                        *syscall.Proc
-	setSecurityDescriptor                   *syscall.Proc
-	deleteSecurityDescriptor                *syscall.Proc
-	fileSystemOperationProcessId            *syscall.Proc
-	fileSystemResolveReparsePoints          *syscall.Proc
-	fileSystemFindReparsePoint              *syscall.Proc
-	debugLogSetHandle                       *syscall.Proc
-	fileSystemSetDebugLogF                  *syscall.Proc
+	posixMapSecurityDescriptorToPermissions dllProc
+	posixMapSidToUid                        dllProc
+	posixMapUidToSid                        dllProc
+	setSecurityDescriptor                   dllProc
+	deleteSecurityDescriptor                dllProc
+	fileSystemOperationProcessId            dllProc
+	fileSystemResolveReparsePoints          dllProc
+	fileSystemFindReparsePoint              dllProc
+	debugLogSetHandle                       dllProc
+	fileSystemSetDebugLogF                  dllProc
 )
 
 // BehaviourDeleteReparsePoint deletes a reparse point.
@@ -1387,7 +1379,7 @@ func delegateResolveReparsePoints(
 	ioStatus, buffer uintptr, size *uintptr,
 ) windows.NTStatus {
 	// Call the WinFSP API
-	result, _, err := fileSystemResolveReparsePoints.Call(
+	err := fileSystemResolveReparsePoints.CallStatus(
 		fileSystem,
 		go_delegateGetReparsePointByName,
 		uintptr(0),
@@ -1398,11 +1390,10 @@ func delegateResolveReparsePoints(
 		buffer,
 		uintptr(unsafe.Pointer(size)),
 	)
-	status := windows.NTStatus(result)
 	if err != nil {
-		return convertNTStatus(err)
+		return convertNTStatus(err) // from error-boxed NTStatus -> NTStatus
 	}
-	return status
+	return windows.STATUS_SUCCESS
 }
 
 var go_delegateResolveReparsePoints = syscall.NewCallbackCDecl(func(
@@ -1451,21 +1442,15 @@ var go_delegateSetReparsePoint = syscall.NewCallbackCDecl(func(
 
 // PosixMapSecurityDescriptorToPermissions maps a Windows security descriptor to POSIX permissions.
 func PosixMapSecurityDescriptorToPermissions(securityDescriptor *windows.SECURITY_DESCRIPTOR) (uid, gid, mode uint32, err error) {
-	result, _, callErr := posixMapSecurityDescriptorToPermissions.Call(
+	err = posixMapSecurityDescriptorToPermissions.CallStatus(
 		uintptr(unsafe.Pointer(securityDescriptor)),
 		uintptr(unsafe.Pointer(&uid)),
 		uintptr(unsafe.Pointer(&gid)),
 		uintptr(unsafe.Pointer(&mode)),
 	)
 
-	status := windows.NTStatus(result)
-	if status != windows.STATUS_SUCCESS {
-		callErr = status
-	} else if callErr == syscall.Errno(0) {
-		callErr = nil
-	}
-	if callErr != nil {
-		return 0, 0, 0, errors.Wrap(callErr, "FspPosixMapSecurityDescriptorToPermissions")
+	if err != nil {
+		return 0, 0, 0, errors.Wrap(err, "FspPosixMapSecurityDescriptorToPermissions")
 	}
 
 	return uid, gid, mode, nil
@@ -1474,42 +1459,26 @@ func PosixMapSecurityDescriptorToPermissions(securityDescriptor *windows.SECURIT
 // PosixMapSidToUid maps a Windows SID to a POSIX UID.
 func PosixMapSidToUid(sid *windows.SID) (uint32, error) {
 	var uid uint32
-	result, _, err := posixMapSidToUid.Call(
+	err := posixMapSidToUid.CallStatus(
 		uintptr(unsafe.Pointer(sid)),
 		uintptr(unsafe.Pointer(&uid)),
 	)
-
-	status := windows.NTStatus(result)
-	if status != windows.STATUS_SUCCESS {
-		err = status
-	} else if err == syscall.Errno(0) {
-		err = nil
-	}
 	if err != nil {
 		return 0, errors.Wrap(err, "FspPosixMapSidToUid")
 	}
-
 	return uid, nil
 }
 
 // PosixMapUidToSid maps a POSIX UID to a Windows SID.
 func PosixMapUidToSid(uid uint32) (*windows.SID, error) {
 	var sid *windows.SID
-	result, _, err := posixMapUidToSid.Call(
+	err := posixMapUidToSid.CallStatus(
 		uintptr(uid),
 		uintptr(unsafe.Pointer(&sid)),
 	)
-
-	status := windows.NTStatus(result)
-	if status != windows.STATUS_SUCCESS {
-		err = status
-	} else if err == syscall.Errno(0) {
-		err = nil
-	}
 	if err != nil {
 		return nil, errors.Wrap(err, "FspPosixMapUidToSid")
 	}
-
 	return sid, nil
 }
 
@@ -1527,19 +1496,12 @@ func SetSecurityDescriptor(
 	modificationDescriptor *windows.SECURITY_DESCRIPTOR,
 ) (*windows.SECURITY_DESCRIPTOR, error) {
 	var outputDescriptor *windows.SECURITY_DESCRIPTOR
-	result, _, err := setSecurityDescriptor.Call(
+	err := setSecurityDescriptor.CallStatus(
 		uintptr(unsafe.Pointer(inputDescriptor)),
 		uintptr(securityInformation),
 		uintptr(unsafe.Pointer(modificationDescriptor)),
 		uintptr(unsafe.Pointer(&outputDescriptor)),
 	)
-
-	status := windows.NTStatus(result)
-	if status != windows.STATUS_SUCCESS {
-		err = status
-	} else if err == syscall.Errno(0) {
-		err = nil
-	}
 	if err != nil {
 		return nil, errors.Wrap(err, "FspSetSecurityDescriptor")
 	}
@@ -1553,12 +1515,12 @@ func SetSecurityDescriptor(
 func DeleteSecurityDescriptor(securityDescriptor *windows.SECURITY_DESCRIPTOR) error {
 	// Pass a function pointer to indicate this was created by FspSetSecurityDescriptor
 	// The C API expects this to match the function that created the descriptor
-	_, _, _ = deleteSecurityDescriptor.Call(
+	_, err := deleteSecurityDescriptor.Call(
 		uintptr(unsafe.Pointer(securityDescriptor)),
-		uintptr(unsafe.Pointer(setSecurityDescriptor)),
+		uintptr(unsafe.Pointer(setSecurityDescriptor.proc)),
 	)
 
-	return nil
+	return err
 }
 
 // DebugLogSetHandle sets the debug log handle for WinFSP debugging output.
@@ -1569,11 +1531,7 @@ func DebugLogSetHandle(handle syscall.Handle) error {
 	if err := tryLoadWinFSP(); err != nil {
 		return err
 	}
-
-	_, _, err := debugLogSetHandle.Call(uintptr(handle))
-	if err == syscall.Errno(0) {
-		err = nil
-	}
+	_, err := debugLogSetHandle.Call(uintptr(handle))
 	return err
 }
 
@@ -1582,7 +1540,7 @@ func DebugLogSetHandle(handle syscall.Handle) error {
 // Valid only during Create, Open and Rename requests when the target exists.
 // This function can only be called from within a file system operation handler.
 func FileSystemOperationProcessId() uint32 {
-	result, _, _ := fileSystemOperationProcessId.Call()
+	result, _ := fileSystemOperationProcessId.Call()
 	return uint32(result)
 }
 
@@ -1596,7 +1554,7 @@ func FileSystemFindReparsePoint(
 
 	var reparsePointIndex uint32
 
-	result, _, callErr := fileSystemFindReparsePoint.Call(
+	result, err := fileSystemFindReparsePoint.Call(
 		uintptr(unsafe.Pointer(fileSystem.fileSystem)), // FileSystem
 		go_delegateGetReparsePointByName,               // GetReparsePointByName callback
 		uintptr(0),                                     // Context (unused)
@@ -1604,11 +1562,8 @@ func FileSystemFindReparsePoint(
 		uintptr(unsafe.Pointer(&reparsePointIndex)),    // PReparsePointIndex
 	)
 
-	if callErr == syscall.Errno(0) {
-		callErr = nil
-	}
-	if callErr != nil {
-		return false, 0, errors.Wrap(callErr, "FspFileSystemFindReparsePoint")
+	if err != nil {
+		return false, 0, errors.Wrap(err, "FspFileSystemFindReparsePoint")
 	}
 	return byte(result) != 0, reparsePointIndex, nil
 }
@@ -1799,11 +1754,11 @@ const (
 )
 
 var (
-	fileSystemCreate *syscall.Proc
-	fileSystemDelete *syscall.Proc
-	setMountPoint    *syscall.Proc
-	startDispatcher  *syscall.Proc
-	stopDispatcher   *syscall.Proc
+	fileSystemCreate dllProc
+	fileSystemDelete dllProc
+	setMountPoint    dllProc
+	startDispatcher  dllProc
+	stopDispatcher   dllProc
 )
 
 // Mount attempts to mount a file system to specified mount
@@ -2010,26 +1965,19 @@ func Mount(
 	copy(volumeParams.FileSystemName[:], utf16Name)
 
 	// Attempt to create the file system now.
-	createResult, _, err := fileSystemCreate.Call(
+	err = fileSystemCreate.CallStatus(
 		uintptr(unsafe.Pointer(utf16Driver)),
 		uintptr(unsafe.Pointer(volumeParams)),
 		uintptr(unsafe.Pointer(fileSystemOps)),
 		uintptr(unsafe.Pointer(&result.fileSystem)),
 	)
 	runtime.KeepAlive(utf16Driver)
-	createStatus := windows.NTStatus(createResult)
-	if err == syscall.Errno(0) {
-		err = nil
-	}
-	if err == nil && createStatus != windows.STATUS_SUCCESS {
-		err = createStatus
-	}
-	if err != nil && err != windows.STATUS_SUCCESS {
+	if err != nil {
 		return nil, errors.Wrap(err, "create file system")
 	}
 	defer func() {
 		if !created {
-			_, _, _ = fileSystemDelete.Call(
+			_, _ = fileSystemDelete.Call(
 				uintptr(unsafe.Pointer(result.fileSystem)))
 		}
 	}()
@@ -2037,7 +1985,7 @@ func Mount(
 
 	if option.debug {
 		// Set debug log level to maximum for debug output
-		_, _, err = fileSystemSetDebugLogF.Call(
+		_, err = fileSystemSetDebugLogF.Call(
 			uintptr(unsafe.Pointer(result.fileSystem)),
 			uintptr(math.MaxUint32),
 		)
@@ -2050,39 +1998,25 @@ func Mount(
 	}
 
 	// Attempt to mount the file system at mount point.
-	mountResult, _, err := setMountPoint.Call(
+	err = setMountPoint.CallStatus(
 		uintptr(unsafe.Pointer(result.fileSystem)),
 		uintptr(unsafe.Pointer(utf16MountPoint)),
 	)
 	runtime.KeepAlive(utf16MountPoint)
-	mountStatus := windows.NTStatus(mountResult)
-	if err == syscall.Errno(0) {
-		err = nil
-	}
-	if err == nil && mountStatus != windows.STATUS_SUCCESS {
-		err = mountStatus
-	}
-	if err != nil && err != windows.STATUS_SUCCESS {
+	if err != nil {
 		return nil, errors.Wrap(err, "mount file system")
 	}
 
 	// Attempt to start the file system dispatcher.
-	startResult, _, err := startDispatcher.Call(
+	err = startDispatcher.CallStatus(
 		uintptr(unsafe.Pointer(result.fileSystem)), uintptr(0),
 	)
-	startStatus := windows.NTStatus(startResult)
-	if err == syscall.Errno(0) {
-		err = nil
-	}
-	if err == nil && startStatus != windows.STATUS_SUCCESS {
-		err = startStatus
-	}
-	if err != nil && err != windows.STATUS_SUCCESS {
+	if err != nil {
 		return nil, errors.Wrap(err, "start dispatcher")
 	}
 	defer func() {
 		if !created {
-			_, _, _ = stopDispatcher.Call(
+			_, _ = stopDispatcher.Call(
 				uintptr(unsafe.Pointer(result.fileSystem)))
 		}
 	}()
@@ -2093,8 +2027,8 @@ func Mount(
 // Unmount destroy the created file system.
 func (f *FileSystem) Unmount() {
 	fileSystem := uintptr(unsafe.Pointer(f.fileSystem))
-	_, _, _ = stopDispatcher.Call(fileSystem)
-	_, _, _ = fileSystemDelete.Call(fileSystem)
+	_, _ = stopDispatcher.Call(fileSystem)
+	_, _ = fileSystemDelete.Call(fileSystem)
 }
 
 // BinPath returns the path to the bin folder where WinFSP is
@@ -2170,19 +2104,71 @@ func loadWinFSPDLL() (*syscall.DLL, error) {
 	return syscall.LoadDLL(filepath.Join(installPath, dllName))
 }
 
+// dllProc is a wrapper around a syscall.Proc with more conventional error
+// return values. See dllProc.Call below for details.
+type dllProc struct {
+	proc *syscall.Proc
+}
+
+// ntStatusPtr is a sentinel value used by dllProc.Call to indicate an argument
+// that should be a pointer to an NTstatus out variable.
+var ntStatusPtrTarget windows.NTStatus
+var ntStatusPtr = uintptr(unsafe.Pointer(&ntStatusPtrTarget))
+
+// Call is like syscall.Proc.Call but instead of always returning a non-nil error interface
+// value (even on success), this Call wrapper returns a nil error on success. It also
+// only returns one non-error result parameter, instead of two, as no callers require
+// more than one result value.
+//
+// Additionally, if an arg is the sentinel value ntStatusPtr, it will be replaced
+// with a pointer to a local NTStatus variable to capture the NTStatus return
+// and return it as an error if it's not STATUS_SUCCESS.
+//
+// When the error is non-nil, it's always of type syscall.Errno, like
+// syscall.Proc.Call.
+func (p dllProc) Call(args ...uintptr) (uintptr, error) {
+	var ntStatus windows.NTStatus
+	statusIdx := slices.Index(args, ntStatusPtr)
+	if statusIdx != -1 {
+		args[statusIdx] = uintptr(unsafe.Pointer(&ntStatus))
+	}
+	res1, _, err := p.proc.Call(args...)
+	if err == syscall.Errno(0) {
+		err = nil
+	}
+	if err == nil && statusIdx != -1 && ntStatus != windows.STATUS_SUCCESS {
+		err = ntStatus
+	}
+	return res1, err
+}
+
+// CallStatus is like syscall.Proc.Call1 but is used for procedures that return a
+// NTSTATUS status code in the first return value, which if non-STATUS_SUCCESS,
+// is returned as an error.
+func (p dllProc) CallStatus(args ...uintptr) error {
+	res1, err := p.Call(args...)
+	if err != nil {
+		return err
+	}
+	if res1 != uintptr(windows.STATUS_SUCCESS) {
+		return windows.NTStatus(res1)
+	}
+	return nil
+}
+
 var winFSPDLL *syscall.DLL
 
-func findProc(name string, target **syscall.Proc) error {
+func findProc(name string, target *dllProc) error {
 	proc, err := winFSPDLL.FindProc(name)
 	if err != nil {
 		return errors.Wrapf(err,
 			"winfsp cannot find proc %q", name)
 	}
-	*target = proc
+	*target = dllProc{proc: proc}
 	return nil
 }
 
-func loadProcs(procs map[string]**syscall.Proc) error {
+func loadProcs(procs map[string]*dllProc) error {
 	for name, proc := range procs {
 		if err := findProc(name, proc); err != nil {
 			return err
@@ -2197,7 +2183,7 @@ func initWinFSP() error {
 		return err
 	}
 	winFSPDLL = dll
-	return loadProcs(map[string]**syscall.Proc{
+	return loadProcs(map[string]*dllProc{
 		"FspFileSystemDeleteDirectoryBuffer":         &deleteDirectoryBuffer,
 		"FspFileSystemAcquireDirectoryBuffer":        &acquireDirectoryBuffer,
 		"FspFileSystemReleaseDirectoryBuffer":        &releaseDirectoryBuffer,
