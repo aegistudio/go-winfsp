@@ -1,4 +1,4 @@
-module github.com/aegistudio/go-winfsp
+module github.com/winfsp/go-winfsp
 
 go 1.23
 

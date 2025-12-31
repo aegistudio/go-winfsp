@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aegistudio/go-winfsp"
-	"github.com/aegistudio/go-winfsp/gofs"
+	"github.com/winfsp/go-winfsp"
+	"github.com/winfsp/go-winfsp/gofs"
 )
 
 func TestMount(t *testing.T) {
