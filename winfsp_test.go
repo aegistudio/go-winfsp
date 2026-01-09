@@ -93,7 +93,7 @@ func TestMount(t *testing.T) {
 	})
 
 	t.Run("RemoveFile", func(t *testing.T) {
-		t.Skip("TODO: make this test pass") // os.Remove is failing with access denied
+		//t.Skip("TODO: make this test pass") // os.Remove is failing with access denied
 
 		const path = `T:\to-delete.txt`
 		wantNotExist(t, path)

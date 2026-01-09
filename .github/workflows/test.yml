@@ -2,8 +2,6 @@ name: go-winfsp
 
 on:
   push:
-    branches:
-      - "master"
   pull_request:
 
 jobs:
