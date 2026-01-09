@@ -342,7 +342,7 @@ type testRegFileInfo struct {
 
 func (fi testRegFileInfo) Name() string      { return fi.baseName }
 func (fi testRegFileInfo) Size() int64       { return fi.size }
-func (fi testRegFileInfo) Mode() os.FileMode { return 0o444 }
+func (fi testRegFileInfo) Mode() os.FileMode { return 0o666 }
 func (fi testRegFileInfo) ModTime() time.Time {
 	return fakeTime
 }

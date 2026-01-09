@@ -3,6 +3,7 @@ package gofs
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -600,6 +601,7 @@ func (fs *fileSystem) SetBasicInfo(
 		return err
 	}
 	fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
+	fmt.Println("ACCESS_DENIED due to SetBasicInfo")
 	return windows.STATUS_ACCESS_DENIED
 }
 
@@ -764,6 +766,7 @@ func (fs *fileSystem) Write(
 	}
 	if (handle.flags&os.O_APPEND != 0) && !writeToEndOfFile {
 		// You may not write to an append-only file.
+		fmt.Println("ACCESS_DENIED due to append file")
 		return 0, windows.STATUS_ACCESS_DENIED
 	}
 	if err := handle.lockChecked(); err != nil {
@@ -846,6 +849,7 @@ func (fs *fileSystem) CanDelete(
 	}
 	defer handle.unlockChecked()
 	if !handle.lock.IsWrite() {
+		fmt.Println("ACCESS_DENIED due to read-only lock in CanDelete")
 		return windows.STATUS_ACCESS_DENIED
 	}
 	fileInfo, err := handle.file.Stat()
@@ -907,6 +911,7 @@ func (fs *fileSystem) Rename(
 		return err
 	}
 	if !handle.lock.IsWrite() {
+		fmt.Println("ACCESS_DENIED due to read-only lock in Rename")
 		return windows.STATUS_ACCESS_DENIED
 	}
 	handle.mtx.Lock()
