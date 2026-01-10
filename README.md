@@ -1,20 +1,20 @@
 # go-winfsp
 
-This is a Golang binding for the native [WinFSP](https://github.com/winfsp/winfsp)
-API, with which you can implement a Windows native filesystem
-based on the WinFSP's framework.
+This is a [Go](https://golang.org) binding for the native [WinFSP](https://github.com/winfsp/winfsp)
+API, which lets you implement a Windows native filesystem
+based on the WinFSP framework.
 
-There's also another Golang binding of WinFSP named
+There's also another Go binding for WinFSP named
 [cgofuse](https://github.com/winfsp/cgofuse), which is based
-on WinFSP's FUSE compatible layer API instead of the native
-one. However I've found it problematic when implementing a
-filesystem backed by a Window's native filesystem, due to
-the semantic difference of POSIX style file API and Window's
-file API. This is the major motive I write this binding.
+on WinFSP's FUSE compatibility layer API instead of the native
+one. However, I've found it problematic when implementing a
+filesystem backed by a Windows native filesystem, due to
+the semantic differences between POSIX style file API and Windows'
+file API. This is the major motivation for writing this package.
 
-The go-winfsp binding should offers a Windows dedicated but
-seamless API to implement a filesystem. However, the caller
-need not to worry about adapting to different platform's API,
-since the API also provides a Golang standard library style
-interface for describing a filesystem, and the adaption job
-should be just like a breeze.
+The go-winfsp binding should offer a Windows-specific but
+seamless API to implement a filesystem. However, callers
+need not worry about adapting to different platform's API,
+since the API also provides a Go standard library style
+interface for describing a filesystem, and the adaption
+should be a breeze.
