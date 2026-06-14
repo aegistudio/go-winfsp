@@ -79,6 +79,12 @@ func init() {
 	registerProc("FspPosixMapUidToSid", &posixMapUidToSid)
 }
 
+var deleteSid dllProc
+
+func init() {
+	registerProc("FspDeleteSid", &deleteSid)
+}
+
 // PosixMapUidToSid maps a POSIX UID to a Windows SID.
 //
 // Will load WinFSP DLL if it has not been loaded, and **panic** if it
@@ -94,7 +100,19 @@ func PosixMapUidToSid(uid uint32) (*windows.SID, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "FspPosixMapUidToSid")
 	}
-	return sid, nil
+
+	// The SID is owned by WinFSP's allocator, so it can't just be returned (it
+	// would leak) nor freed with LocalFree/GC.
+	defer func() {
+		deleteSid.Call(
+			uintptr(unsafe.Pointer(sid)),
+			posixMapUidToSid.proc.Addr(),
+		)
+		runtime.KeepAlive(sid)
+	}()
+
+	// Return a Go-managed copy.
+	return sid.Copy()
 }
 
 var setSecurityDescriptor dllProc
