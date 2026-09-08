@@ -219,6 +219,17 @@ load error there.
 // When the error is non-nil, it's always of type syscall.Errno, like
 // syscall.Proc.Call.
 //
+// Every uintptr argument that is really an out-param's address MUST be
+// written as the literal conversion uintptr(unsafe.Pointer(&x)) directly in
+// the call expression to Call/CallStatus -- e.g. Call(uintptr(unsafe.Pointer(&x))),
+// never p := uintptr(unsafe.Pointer(&x)); Call(p). The //go:uintptrescapes
+// pragma below only recognizes the former shape; the latter leaves x
+// stack-allocated and reachable only through a uintptr the runtime's stack
+// maps don't know about, so a stack move between taking the address and the
+// DLL's write corrupts it silently. The compiler gives no warning either
+// way -- this is enforced by convention only. See the PR that added this
+// comment for a reproduction of both shapes.
+//
 //go:uintptrescapes
 func (p dllProc) Call(args ...uintptr) (uintptr, error) {
 	p.EnsureInitialized()
