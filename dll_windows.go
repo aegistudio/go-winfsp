@@ -176,6 +176,18 @@ type dllProc struct {
 var ntStatusPtrTarget windows.NTStatus
 var ntStatusPtr = uintptr(unsafe.Pointer(&ntStatusPtrTarget))
 
+// newHeapNTStatus returns a heap-allocated NTStatus. It is deliberately a
+// separate, non-inlinable function: returning the pointer is what forces the
+// allocation onto the heap. Writing "new(windows.NTStatus)" directly inside
+// Call leaves it on the stack -- escape analysis reports "does not escape",
+// because converting the address to uintptr hides it from the analysis, and
+// runtime.KeepAlive does not change that. Verified with -gcflags='-m -m'.
+//
+//go:noinline
+func newHeapNTStatus() *windows.NTStatus {
+	return new(windows.NTStatus)
+}
+
 // EnsureInitialized ensure this dllProc to be initialized.
 func (p dllProc) EnsureInitialized() {
 	if err := tryLoadWinFSP(); err != nil {
@@ -206,19 +218,31 @@ load error there.
 //
 // When the error is non-nil, it's always of type syscall.Errno, like
 // syscall.Proc.Call.
+//
+//go:uintptrescapes
 func (p dllProc) Call(args ...uintptr) (uintptr, error) {
 	p.EnsureInitialized()
-	var ntStatus windows.NTStatus
+	// The //go:uintptrescapes above covers the caller-supplied uintptr
+	// arguments, but NOT this local: the pragma forces the pointees of the
+	// function's uintptr PARAMETERS onto the heap, and ntStatus is a local of
+	// this function. Its address is laundered into a []uintptr on the line
+	// below, which is invisible to the runtime's pointer maps, so if the
+	// goroutine stack moves between that assignment and the DLL's write, the
+	// DLL writes an NTSTATUS into a freed stack segment. Allocating it on the
+	// heap closes that window -- heap objects do not move under Go's
+	// non-moving collector.
+	ntStatus := newHeapNTStatus()
 	statusIdx := slices.Index(args, ntStatusPtr)
 	if statusIdx != -1 {
-		args[statusIdx] = uintptr(unsafe.Pointer(&ntStatus))
+		args[statusIdx] = uintptr(unsafe.Pointer(ntStatus))
 	}
 	res1, _, err := p.proc.Call(args...)
+	runtime.KeepAlive(ntStatus)
 	if err == syscall.Errno(0) {
 		err = nil
 	}
-	if err == nil && statusIdx != -1 && ntStatus != windows.STATUS_SUCCESS {
-		err = ntStatus
+	if err == nil && statusIdx != -1 && *ntStatus != windows.STATUS_SUCCESS {
+		err = *ntStatus
 	}
 	return res1, err
 }
@@ -226,6 +250,8 @@ func (p dllProc) Call(args ...uintptr) (uintptr, error) {
 // CallStatus is like syscall.Proc.Call1 but is used for procedures that return a
 // NTSTATUS status code in the first return value, which if non-STATUS_SUCCESS,
 // is returned as an error.
+//
+//go:uintptrescapes
 func (p dllProc) CallStatus(args ...uintptr) error {
 	res1, err := p.Call(args...)
 	if err != nil {
